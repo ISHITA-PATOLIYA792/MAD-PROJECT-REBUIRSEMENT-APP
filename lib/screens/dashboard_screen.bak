@@ -1,0 +1,1718 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:reimbursement_box/main.dart'; // for themeNotifier
+import 'package:reimbursement_box/widgets/animated_theme_toggle.dart';
+import 'package:reimbursement_box/widgets/gradient_card.dart';
+import 'package:reimbursement_box/widgets/shimmer_loading.dart';
+import 'package:reimbursement_box/widgets/gradient_button.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:intl/intl.dart';
+import 'dart:math' as math;
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({Key? key}) : super(key: key);
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  final supabase = Supabase.instance.client;
+  String _selectedDateFilter = 'This Month';
+  String _selectedProject = 'All Projects';
+  
+  // Data variables
+  int _totalSubmitted = 0;
+  int _pendingApprovals = 0;
+  int _rejectedExpenses = 0;
+  int _approvedExpenses = 0;
+  bool _isLoading = true;
+  bool _hasError = false;
+  String _errorMessage = '';
+  
+  final List<String> _dateFilters = ['This Week', 'This Month', 'This Year'];
+  List<String> _projectFilters = ['All Projects'];
+  
+  List<Map<String, dynamic>> _recentExpenses = [];
+  
+  // Expense category data for charts
+  Map<String, double> _expensesByCategory = {};
+  List<Map<String, dynamic>> _expensesByMonth = [];
+
+  // Add this after existing field declarations in the _DashboardScreenState class
+  List<Map<String, dynamic>> _projectExpenses = [];
+  bool _projectExpensesLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSession();
+    _loadDashboardData();
+  }
+
+  void _checkSession() {
+    final activeSession = supabase.auth.currentSession;
+    if (activeSession == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Navigator.pushReplacementNamed(context, '/auth');
+      });
+    }
+  }
+
+  Future<void> _loadDashboardData() async {
+    if (mounted) {
+      setState(() {
+        _isLoading = true;
+        _hasError = false;
+        _projectExpensesLoading = true;
+      });
+    }
+    
+    try {
+      await Future.wait([
+        _fetchExpenseStatistics(),
+        _fetchRecentExpenses(),
+        _fetchExpenseCategories(),
+        _fetchExpensesByMonth(),
+        _fetchProjects(),
+        _fetchExpensesByProject(), // Add this new method
+      ]);
+      
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error loading dashboard data: $e');
+      }
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _hasError = true;
+          _errorMessage = 'Failed to load dashboard data. Please try again.';
+        });
+      }
+    }
+  }
+  
+  Future<void> _fetchExpenseStatistics() async {
+    try {
+      // Remove user filtering - just get all expenses
+      final result = await supabase
+          .from('expenses')
+          .select('status')
+          .filter('created_at', 'gte', _getDateFilter());
+      
+      int submitted = result.length;
+      int pending = 0;
+      int rejected = 0;
+      int approved = 0;
+      
+      // Count statuses
+      for (final row in result) {
+        switch (row['status']) {
+          case 'pending':
+            pending++;
+            break;
+          case 'rejected':
+            rejected++;
+            break;
+          case 'approved':
+            approved++;
+            break;
+        }
+      }
+      
+      if (mounted) {
+        setState(() {
+          _totalSubmitted = submitted;
+          _pendingApprovals = pending;
+          _rejectedExpenses = rejected;
+          _approvedExpenses = approved;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error fetching expense statistics: $e');
+      }
+    }
+  }
+  
+  Future<void> _fetchRecentExpenses() async {
+    try {
+      // Remove user filtering - just get recent expenses
+      final result = await supabase
+          .from('expenses')
+          .select('id, title, amount, created_at, status, category')
+          .order('created_at', ascending: false)
+          .limit(5);
+      
+      List<Map<String, dynamic>> expenses = [];
+      for (final row in result) {
+        expenses.add({
+          'id': row['id'],
+          'title': row['title'],
+          'amount': (row['amount'] as num).toDouble(),
+          'date': DateTime.parse(row['created_at']),
+          'status': row['status'],
+          'category': row['category'] ?? 'Other',
+        });
+      }
+      
+      if (mounted) {
+        setState(() {
+          _recentExpenses = expenses;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error fetching recent expenses: $e');
+      }
+    }
+  }
+  
+  Future<void> _fetchExpenseCategories() async {
+    try {
+      // Remove user filtering - just get all expenses by category
+      final result = await supabase
+          .from('expenses')
+          .select('category, amount')
+          .filter('created_at', 'gte', _getDateFilter());
+      
+      Map<String, double> categories = {};
+      for (final row in result) {
+        final category = row['category'] ?? 'Other';
+        final amount = (row['amount'] as num).toDouble();
+        
+        if (categories.containsKey(category)) {
+          categories[category] = categories[category]! + amount;
+        } else {
+          categories[category] = amount;
+        }
+      }
+      
+      if (mounted) {
+        setState(() {
+          _expensesByCategory = categories;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error fetching expense categories: $e');
+      }
+    }
+  }
+  
+  Future<void> _fetchExpensesByMonth() async {
+    try {
+      // Get expenses for last 6 months
+      final endDate = DateTime.now();
+      final startDate = DateTime(endDate.year, endDate.month - 5, 1);
+      
+      // Remove user filtering - just get expenses by date range
+      final result = await supabase
+          .from('expenses')
+          .select('created_at, amount')
+          .gte('created_at', startDate.toIso8601String())
+          .lte('created_at', endDate.toIso8601String());
+      
+      // Group by month
+      Map<String, double> expensesByMonth = {};
+      for (final row in result) {
+        final date = DateTime.parse(row['created_at']);
+        final month = DateFormat('MMM y').format(date);
+        final amount = (row['amount'] as num).toDouble();
+        
+        if (expensesByMonth.containsKey(month)) {
+          expensesByMonth[month] = expensesByMonth[month]! + amount;
+        } else {
+          expensesByMonth[month] = amount;
+        }
+      }
+      
+      // Convert to list for chart
+      List<Map<String, dynamic>> monthlyData = [];
+      for (int i = 0; i < 6; i++) {
+        final date = DateTime(endDate.year, endDate.month - i, 1);
+        final month = DateFormat('MMM y').format(date);
+        monthlyData.add({
+          'month': month,
+          'amount': expensesByMonth[month] ?? 0.0,
+          'index': 5 - i, // Reverse index for chart
+        });
+      }
+      
+      // Sort by date
+      monthlyData.sort((a, b) => a['index'].compareTo(b['index']));
+      
+      if (mounted) {
+        setState(() {
+          _expensesByMonth = monthlyData;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error fetching expenses by month: $e');
+      }
+    }
+  }
+  
+  Future<void> _fetchProjects() async {
+    try {
+      final result = await supabase.from('projects').select('name').order('name');
+      
+      List<String> projects = ['All Projects'];
+      for (final row in result) {
+        projects.add(row['name']);
+      }
+      
+      if (mounted) {
+        setState(() {
+          _projectFilters = projects;
+        });
+      }
+    } catch (e) {
+      // If we can't get projects, just use the default "All Projects"
+      if (kDebugMode) {
+        print('Error fetching projects: $e');
+      }
+    }
+  }
+  
+  Future<void> _fetchExpensesByProject() async {
+    try {
+      // First get projects with names
+      final projectsResult = await supabase
+          .from('projects')
+          .select('id, name');
+      
+      // Get all expenses with project IDs
+      final expensesResult = await supabase
+          .from('expenses')
+          .select('amount, project_id')
+          .filter('created_at', 'gte', _getDateFilter());
+      
+      // Build a map of project IDs to total amounts
+      Map<String, double> projectAmounts = {};
+      Map<String, String> projectNames = {};
+      
+      // Create mapping of project IDs to names
+      for (final project in projectsResult) {
+        projectNames[project['id'].toString()] = project['name'];
+        projectAmounts[project['id'].toString()] = 0.0;
+      }
+      
+      // Sum up expenses by project
+      for (final expense in expensesResult) {
+        final projectId = expense['project_id']?.toString();
+        if (projectId != null && projectAmounts.containsKey(projectId)) {
+          projectAmounts[projectId] = projectAmounts[projectId]! + (expense['amount'] as num).toDouble();
+        }
+      }
+      
+      // Convert to list of project data
+      List<Map<String, dynamic>> projectList = [];
+      
+      projectAmounts.forEach((id, amount) {
+        if (amount > 0) { // Only include projects with expenses
+          // Generate a unique color for this project
+          final hue = (projectList.length * 137.5) % 360; // Golden ratio to get visually distinct colors
+          
+          projectList.add({
+            'id': id,
+            'name': projectNames[id] ?? 'Unknown Project',
+            'amount': amount,
+            'color': HSVColor.fromAHSV(1.0, hue, 0.75, 0.95).toColor(),
+            'darkColor': HSVColor.fromAHSV(1.0, hue, 0.85, 0.75).toColor(),
+          });
+        }
+      });
+      
+      // Sort by amount (highest first)
+      projectList.sort((a, b) => b['amount'].compareTo(a['amount']));
+      
+      if (mounted) {
+        setState(() {
+          _projectExpenses = projectList;
+          _projectExpensesLoading = false;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error fetching expenses by project: $e');
+      }
+      if (mounted) {
+        setState(() {
+          _projectExpensesLoading = false;
+        });
+      }
+    }
+  }
+  
+  String _getDateFilter() {
+    final now = DateTime.now();
+    switch (_selectedDateFilter) {
+      case 'This Week':
+        // Get start of week (Monday)
+        final startOfWeek = now.subtract(Duration(days: now.weekday - 1));
+        return DateTime(startOfWeek.year, startOfWeek.month, startOfWeek.day).toIso8601String();
+      case 'This Month':
+        return DateTime(now.year, now.month, 1).toIso8601String();
+      case 'This Year':
+        return DateTime(now.year, 1, 1).toIso8601String();
+      default:
+        return DateTime(now.year, now.month, 1).toIso8601String();
+    }
+  }
+
+  Future<void> _signOut() async {
+    await supabase.auth.signOut();
+    if (mounted) {
+      Navigator.pushReplacementNamed(context, '/auth');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = supabase.auth.currentUser;
+    final theme = Theme.of(context);
+    
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Dashboard'),
+        actions: [
+          // theme toggle button
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8.0),
+            child: AnimatedThemeToggle(size: 32.0),
+          ),
+          IconButton(
+            icon: const Icon(Icons.notifications),
+            onPressed: () {},
+          ),
+        ],
+      ),
+      drawer: _buildDrawer(user),
+      body: RefreshIndicator(
+        onRefresh: _loadDashboardData,
+        child: _hasError 
+          ? _buildErrorView() 
+          : ListView(
+              padding: const EdgeInsets.all(16.0),
+              children: [
+                _buildProfileSummary(user),
+                const SizedBox(height: 24),
+                Text('Employee Dashboard', style: theme.textTheme.headlineSmall),
+                const SizedBox(height: 16),
+                _buildStatisticsCards(),
+                const SizedBox(height: 24),
+                _buildFilters(),
+                const SizedBox(height: 24),
+                _buildExpenseCharts(),
+                const SizedBox(height: 24),
+                _buildProjectExpensesVisual(), // Add this new section
+                const SizedBox(height: 24),
+                _buildRecentExpenses(),
+              ],
+            ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          // Navigate to add expense screen
+          Navigator.pushNamed(context, '/add_expense');
+        },
+        child: const Icon(Icons.add),
+      ),
+    );
+  }
+  
+  Widget _buildErrorView() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 60,
+              color: Colors.red.shade300,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              _errorMessage,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 16),
+            ),
+            const SizedBox(height: 24),
+            GradientButton(
+              text: 'Try Again',
+              onPressed: _loadDashboardData,
+              icon: Icons.refresh,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDrawer(User? user) {
+    return Drawer(
+      child: ListView(
+        padding: EdgeInsets.zero,
+        children: [
+          DrawerHeader(
+            decoration: BoxDecoration(
+              color: Theme.of(context).primaryColor,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const CircleAvatar(
+                  radius: 30,
+                  child: Icon(Icons.person, size: 30),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  user?.email ?? 'User',
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                ),
+                Text(
+                  user?.id ?? '',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.dashboard),
+            title: const Text('Dashboard'),
+            selected: true,
+            onTap: () => Navigator.pop(context),
+          ),
+          ListTile(
+            leading: const Icon(Icons.receipt_long),
+            title: const Text('Submit Expense'),
+            onTap: () {
+              Navigator.pop(context);
+              // Navigate to submit expense screen
+              Navigator.pushNamed(context, '/add_expense');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.list_alt),
+            title: const Text('My Expenses'),
+            onTap: () {
+              Navigator.pop(context);
+              // Navigate to my expenses screen
+              Navigator.pushNamed(context, '/my_expenses');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.work),
+            title: const Text('My Projects'),
+            onTap: () {
+              Navigator.pop(context);
+              // Navigate to my projects screen
+              Navigator.pushNamed(context, '/my_projects');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.monetization_on),
+            title: const Text('My Compensation'),
+            onTap: () {
+              Navigator.pop(context);
+              // Navigate to my compensation screen
+              Navigator.pushNamed(context, '/my_compensation');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.settings),
+            title: const Text('Settings'),
+            onTap: () {
+              Navigator.pop(context);
+              // Navigate to settings screen
+            },
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.logout),
+            title: const Text('Logout'),
+            onTap: _signOut,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProfileSummary(User? user) {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          children: [
+            const CircleAvatar(
+              radius: 30,
+              backgroundColor: Colors.purple,
+              child: Icon(Icons.person, size: 30, color: Colors.white),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    user?.email?.split('@').first ?? 'User',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    user?.email ?? 'example@company.com',
+                    style: TextStyle(color: Colors.grey[600]),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Employee ID: ${user?.id.substring(0, 8) ?? '12345678'}',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.edit),
+              onPressed: () {
+                // Navigate to profile edit screen
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatisticsCards() {
+    return ShimmerLoading(
+      isLoading: _isLoading,
+      child: GridView.count(
+        crossAxisCount: 2,
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 12,
+        childAspectRatio: 1.6,
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        children: [
+          _buildStatCard('Total', _totalSubmitted.toString(), Colors.blue, 
+              Icons.receipt_long_rounded, [Color(0xFF4A6FFF), Color(0xFF7A54FF)]),
+          _buildStatCard('Pending', _pendingApprovals.toString(), Colors.orange, 
+              Icons.hourglass_empty_rounded, [Color(0xFFFF9D54), Color(0xFFFF7D54)]),
+          _buildStatCard('Rejected', _rejectedExpenses.toString(), Colors.red, 
+              Icons.cancel_rounded, [Color(0xFFFF5454), Color(0xFFFF3D7F)]),
+          _buildStatCard('Approved', _approvedExpenses.toString(), Colors.green, 
+              Icons.check_circle_rounded, [Color(0xFF42CD85), Color(0xFF00C6B3)]),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatCard(String title, String value, Color color, IconData icon, List<Color> gradientColors) {
+    return GradientCard(
+      useGradientBorder: true,
+      isPrimary: false,
+      borderWidth: 2,
+      borderRadius: 18,
+      elevation: 3,
+      margin: const EdgeInsets.all(0),
+      padding: EdgeInsets.zero,
+      child: Stack(
+        children: [
+          // Gradient overlay in the corner
+          Positioned(
+            top: -15,
+            right: -15,
+            child: Container(
+              height: 55,
+              width: 55,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  colors: gradientColors,
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: gradientColors[0].withOpacity(0.3),
+                    blurRadius: 8,
+                    offset: Offset(0, 2),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          // Content
+          Padding(
+            padding: const EdgeInsets.all(14.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                // Title and icon
+                Row(
+                  children: [
+                    Icon(
+                      icon,
+                      size: 18,
+                      color: gradientColors[0],
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: Colors.grey[700],
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+                
+                SizedBox(height: 6),
+                
+                // Value with bigger font
+                Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: 30,
+                    fontWeight: FontWeight.bold,
+                    color: gradientColors[0],
+                  ),
+                ),
+                
+                SizedBox(height: 8),
+                
+                // Progress indicator with rounded corners
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: _totalSubmitted > 0 
+                        ? int.parse(value) / _totalSubmitted 
+                        : 0.0,
+                    backgroundColor: Colors.grey[200],
+                    valueColor: AlwaysStoppedAnimation<Color>(gradientColors[0]),
+                    minHeight: 6,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilters() {
+    return Row(
+      children: [
+        Expanded(
+          child: DropdownButtonFormField<String>(
+            decoration: InputDecoration(
+              labelText: 'Date Filter',
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            ),
+            value: _selectedDateFilter,
+            items: _dateFilters.map((filter) {
+              return DropdownMenuItem(
+                value: filter,
+                child: Text(filter),
+              );
+            }).toList(),
+            onChanged: (value) {
+              if (value != null) {
+                setState(() {
+                  _selectedDateFilter = value;
+                });
+                _loadDashboardData();
+              }
+            },
+          ),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: DropdownButtonFormField<String>(
+            decoration: InputDecoration(
+              labelText: 'Project Filter',
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            ),
+            value: _selectedProject,
+            items: _projectFilters.map((project) {
+              return DropdownMenuItem(
+                value: project,
+                child: Text(project),
+              );
+            }).toList(),
+            onChanged: (value) {
+              if (value != null) {
+                setState(() {
+                  _selectedProject = value;
+                });
+                _loadDashboardData();
+              }
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildExpenseCharts() {
+    return ShimmerLoading(
+      isLoading: _isLoading,
+      child: Column(
+        children: [
+          GradientCard(
+            elevation: 4,
+            useGradientBorder: true,
+            borderWidth: 2,
+            isPrimary: true,
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.category_rounded,
+                      color: Theme.of(context).primaryColor,
+                      size: 20,
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      'Expenses by Category',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold, 
+                        fontSize: 16,
+                        color: Theme.of(context).primaryColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  height: 200,
+                  child: _expensesByCategory.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.pie_chart_outline,
+                              size: 48,
+                              color: Colors.grey[400],
+                            ),
+                            SizedBox(height: 16),
+                            Text(
+                              'No expense data available',
+                              style: TextStyle(color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      )
+                    : BarChart(
+                        BarChartData(
+                          alignment: BarChartAlignment.spaceAround,
+                          maxY: _getMaxCategoryAmount(),
+                          barTouchData: BarTouchData(
+                            enabled: true,
+                            touchTooltipData: BarTouchTooltipData(
+                              getTooltipItem: (group, groupIndex, rod, rodIndex) {
+                                final categories = _expensesByCategory.keys.toList();
+                                if (groupIndex < categories.length) {
+                                  final category = categories[groupIndex];
+                                  return BarTooltipItem(
+                                    '$category\n\$${rod.toY.toStringAsFixed(2)}',
+                                    const TextStyle(color: Colors.white),
+                                  );
+                                }
+                                return null;
+                              },
+                            ),
+                          ),
+                          titlesData: FlTitlesData(
+                            show: true,
+                            bottomTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  final categories = _expensesByCategory.keys.toList();
+                                  final index = value.toInt();
+                                  if (index >= 0 && index < categories.length) {
+                                    final category = categories[index];
+                                    // Abbreviated category name
+                                    return Padding(
+                                      padding: const EdgeInsets.only(top: 8.0),
+                                      child: Text(
+                                        category.length > 5 
+                                            ? '${category.substring(0, 5)}...' 
+                                            : category,
+                                        style: const TextStyle(fontSize: 10),
+                                      ),
+                                    );
+                                  }
+                                  return const SizedBox.shrink();
+                                },
+                              ),
+                            ),
+                            leftTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  return Text(
+                                    '\$${value.toInt()}',
+                                    style: const TextStyle(fontSize: 10),
+                                  );
+                                },
+                                interval: _getMaxCategoryAmount() / 4,
+                              ),
+                            ),
+                            topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                            rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                          ),
+                          gridData: FlGridData(
+                            show: true,
+                            drawVerticalLine: false,
+                            horizontalInterval: _getMaxCategoryAmount() / 4,
+                          ),
+                          borderData: FlBorderData(
+                            show: false,
+                          ),
+                          barGroups: _getBarGroups(),
+                        ),
+                      ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          GradientCard(
+            elevation: 4,
+            useGradientBorder: true,
+            borderWidth: 2,
+            isPrimary: true,
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.timeline_rounded,
+                      color: Theme.of(context).primaryColor,
+                      size: 20,
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      'Expenses Over Time',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold, 
+                        fontSize: 16,
+                        color: Theme.of(context).primaryColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  height: 200,
+                  child: _expensesByMonth.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.show_chart,
+                              size: 48,
+                              color: Colors.grey[400],
+                            ),
+                            SizedBox(height: 16),
+                            Text(
+                              'No expense data available',
+                              style: TextStyle(color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      )
+                    : LineChart(
+                        LineChartData(
+                          gridData: FlGridData(
+                            show: true,
+                            drawVerticalLine: false,
+                          ),
+                          titlesData: FlTitlesData(
+                            show: true,
+                            bottomTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  final index = value.toInt();
+                                  if (index >= 0 && index < _expensesByMonth.length) {
+                                    final month = _expensesByMonth[index]['month'].toString().split(' ')[0];
+                                    return Padding(
+                                      padding: const EdgeInsets.only(top: 8.0),
+                                      child: Text(month, style: const TextStyle(fontSize: 10)),
+                                    );
+                                  }
+                                  return const SizedBox.shrink();
+                                },
+                              ),
+                            ),
+                            leftTitles: AxisTitles(
+                              sideTitles: SideTitles(
+                                showTitles: true,
+                                getTitlesWidget: (double value, TitleMeta meta) {
+                                  return Text(
+                                    '\$${value.toInt()}',
+                                    style: const TextStyle(fontSize: 10),
+                                  );
+                                },
+                                interval: _getMaxMonthlyAmount() / 4,
+                              ),
+                            ),
+                            topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                            rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                          ),
+                          borderData: FlBorderData(
+                            show: true,
+                            border: Border.all(color: Colors.grey[300]!),
+                          ),
+                          minX: 0,
+                          maxX: _expensesByMonth.length - 1.0,
+                          minY: 0,
+                          maxY: _getMaxMonthlyAmount(),
+                          lineBarsData: [
+                            LineChartBarData(
+                              spots: _getLineSpots(),
+                              isCurved: true,
+                              color: Theme.of(context).primaryColor,
+                              barWidth: 3,
+                              isStrokeCapRound: true,
+                              dotData: FlDotData(
+                                show: true,
+                                getDotPainter: (spot, percent, barData, index) {
+                                  return FlDotCirclePainter(
+                                    radius: 5,
+                                    color: Theme.of(context).primaryColor,
+                                    strokeWidth: 2,
+                                    strokeColor: Colors.white,
+                                  );
+                                },
+                              ),
+                              belowBarData: BarAreaData(
+                                show: true,
+                                color: Theme.of(context).primaryColor.withOpacity(0.2),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  double _getMaxCategoryAmount() {
+    if (_expensesByCategory.isEmpty) return 100.0;
+    return _expensesByCategory.values.reduce((max, value) => max > value ? max : value) + 50.0;
+  }
+  
+  List<BarChartGroupData> _getBarGroups() {
+    final categories = _expensesByCategory.keys.toList();
+    final List<BarChartGroupData> barGroups = [];
+    
+    for (int i = 0; i < categories.length; i++) {
+      final category = categories[i];
+      final amount = _expensesByCategory[category] ?? 0.0;
+      
+      barGroups.add(
+        BarChartGroupData(
+          x: i,
+          barRods: [
+            BarChartRodData(
+              toY: amount,
+              color: Theme.of(context).primaryColor,
+              width: 16,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(4),
+                topRight: Radius.circular(4),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    
+    return barGroups;
+  }
+  
+  double _getMaxMonthlyAmount() {
+    if (_expensesByMonth.isEmpty) return 1000.0;
+    final amounts = _expensesByMonth.map((e) => e['amount'] as double).toList();
+    return amounts.reduce((max, value) => max > value ? max : value) + 100.0;
+  }
+  
+  List<FlSpot> _getLineSpots() {
+    final List<FlSpot> spots = [];
+    
+    for (int i = 0; i < _expensesByMonth.length; i++) {
+      final amount = _expensesByMonth[i]['amount'] as double;
+      spots.add(FlSpot(i.toDouble(), amount));
+    }
+    
+    return spots;
+  }
+
+  Widget _buildProjectExpensesVisual() {
+    return ShimmerLoading(
+      isLoading: _projectExpensesLoading,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.business_center_rounded,
+                    color: Theme.of(context).primaryColor,
+                    size: 20,
+                  ),
+                  SizedBox(width: 8),
+                  Text(
+                    'Project Expenses',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                  ),
+                ],
+              ),
+              if (_projectExpenses.isNotEmpty)
+                TextButton.icon(
+                  icon: Icon(Icons.visibility_rounded, size: 16),
+                  label: Text('View All'),
+                  onPressed: () {
+                    // Show all projects if needed
+                  },
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _projectExpenses.isEmpty
+              ? GradientCard(
+                  useGradientBorder: true,
+                  borderWidth: 2,
+                  isPrimary: false,
+                  child: Padding(
+                    padding: const EdgeInsets.all(30.0),
+                    child: Center(
+                      child: Column(
+                        children: [
+                          Icon(
+                            Icons.business_center_outlined,
+                            size: 48,
+                            color: Colors.grey[400],
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'No project expenses found',
+                            style: TextStyle(
+                              color: Colors.grey[600],
+                              fontSize: 16,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              : GradientCard(
+                  useGradientBorder: true,
+                  borderWidth: 2,
+                  isPrimary: false,
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      // Hexagon project visualization
+                      SizedBox(
+                        height: 250,
+                        child: _buildProjectHexagons(),
+                      ),
+                      
+                      // Project expense list
+                      const SizedBox(height: 16),
+                      const Divider(),
+                      const SizedBox(height: 8),
+                      ...List.generate(
+                        _projectExpenses.length > 5 ? 5 : _projectExpenses.length,
+                        (index) => _buildProjectExpenseItem(index),
+                      ),
+                    ],
+                  ),
+                ),
+        ],
+      ),
+    );
+  }
+
+  // Unique hexagon visualization
+  Widget _buildProjectHexagons() {
+    if (_projectExpenses.isEmpty) return const SizedBox();
+    
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Calculate total amount
+        final totalAmount = _projectExpenses.fold<double>(
+          0, (prev, project) => prev + (project['amount'] as double)
+        );
+        
+        // Only show top 5 projects in visualization
+        final List<Map<String, dynamic>> topProjects = _projectExpenses.length > 5
+            ? _projectExpenses.sublist(0, 5)
+            : _projectExpenses;
+            
+        // Display projects as interactive hexagons
+        return Stack(
+          alignment: Alignment.center,
+          children: [
+            // Center total
+            Container(
+              width: 100,
+              height: 100,
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardColor,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 10,
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'Total',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  Text(
+                    '\$${totalAmount.toStringAsFixed(0)}',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            
+            // Surrounding projects
+            ...List.generate(topProjects.length, (index) {
+              // Position in a circle around the center
+              final angle = (index / topProjects.length) * 2 * 3.14159;
+              final radius = 90.0; // Distance from center
+              
+              // Calculate position
+              final x = radius * math.cos(angle);
+              final y = radius * math.sin(angle);
+              
+              // Calculate size based on percentage of total
+              final percentage = topProjects[index]['amount'] / totalAmount;
+              final size = 40.0 + (percentage * 50.0); // Min 40, max 90
+              
+              return Positioned(
+                left: constraints.maxWidth / 2 + x - (size / 2),
+                top: constraints.maxHeight / 2 + y - (size / 2),
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.0, end: 1.0),
+                  duration: Duration(milliseconds: 500 + (index * 200)),
+                  curve: Curves.elasticOut,
+                  builder: (context, value, _) {
+                    return Transform.scale(
+                      scale: value,
+                      child: _buildHexagon(
+                        topProjects[index],
+                        size * value,
+                        percentage,
+                      ),
+                    );
+                  },
+                ),
+              );
+            }),
+            
+            // Connecting lines in background
+            ...List.generate(topProjects.length, (index) {
+              final angle = (index / topProjects.length) * 2 * 3.14159;
+              final x = 90.0 * math.cos(angle);
+              final y = 90.0 * math.sin(angle);
+              
+              return Positioned.fill(
+                child: CustomPaint(
+                  painter: LinePainter(
+                    start: Offset(constraints.maxWidth / 2, constraints.maxHeight / 2),
+                    end: Offset(constraints.maxWidth / 2 + x, constraints.maxHeight / 2 + y),
+                    color: topProjects[index]['color'].withOpacity(0.3),
+                  ),
+                ),
+              );
+            }),
+          ],
+        );
+      },
+    );
+  }
+  
+  Widget _buildHexagon(Map<String, dynamic> project, double size, double percentage) {
+    return GestureDetector(
+      onTap: () {
+        // Could show project details
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${project['name']}: \$${project['amount'].toStringAsFixed(2)}')),
+        );
+      },
+      child: Container(
+        width: size,
+        height: size,
+        child: CustomPaint(
+          painter: HexagonPainter(
+            color: project['color'],
+            shadowColor: project['darkColor'],
+          ),
+          child: Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '${(percentage * 100).toStringAsFixed(0)}%',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: size * 0.22,
+                  ),
+                ),
+                Text(
+                  project['name'].toString().length > 8
+                      ? '${project['name'].toString().substring(0, 7)}...'
+                      : project['name'],
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: size * 0.16,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildProjectExpenseItem(int index) {
+    final project = _projectExpenses[index];
+    
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: Duration(milliseconds: 400),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, _) {
+        return Opacity(
+          opacity: value,
+          child: Container(
+            margin: EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                // Left color indicator
+                Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: project['color'],
+                  ),
+                ),
+                SizedBox(width: 12),
+                
+                // Project details
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            project['name'],
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 15,
+                            ),
+                          ),
+                          Text(
+                            '\$${project['amount'].toStringAsFixed(2)}',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SizedBox(height: 4),
+                      TweenAnimationBuilder<double>(
+                        tween: Tween(begin: 0.0, end: 1.0),
+                        duration: Duration(milliseconds: 800),
+                        curve: Curves.easeOutQuart,
+                        builder: (context, animValue, _) {
+                          // Calculate percentage of the largest amount
+                          final maxAmount = _projectExpenses.first['amount'];
+                          final percentage = project['amount'] / maxAmount;
+                          
+                          return Stack(
+                            children: [
+                              // Background
+                              Container(
+                                height: 8,
+                                width: double.infinity,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(4),
+                                  color: Colors.grey[200],
+                                ),
+                              ),
+                              // Foreground
+                              Container(
+                                height: 8,
+                                width: percentage * animValue * MediaQuery.of(context).size.width * 0.7,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(4),
+                                  gradient: LinearGradient(
+                                    colors: [project['color'], project['darkColor']],
+                                    begin: Alignment.centerLeft,
+                                    end: Alignment.centerRight,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// Custom Painter for connecting lines
+class LinePainter extends CustomPainter {
+  final Offset start;
+  final Offset end;
+  final Color color;
+  
+  LinePainter({required this.start, required this.end, required this.color});
+  
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1
+      ..style = PaintingStyle.stroke;
+    
+    canvas.drawLine(start, end, paint);
+  }
+  
+  @override
+  bool shouldRepaint(covariant LinePainter oldDelegate) => false;
+}
+
+// Custom hexagon painter
+class HexagonPainter extends CustomPainter {
+  final Color color;
+  final Color shadowColor;
+  
+  HexagonPainter({required this.color, required this.shadowColor});
+  
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = Path();
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2;
+    
+    // Create hexagon path
+    for (int i = 0; i < 6; i++) {
+      final angle = (i * 60) * math.pi / 180;
+      final point = Offset(
+        center.dx + radius * math.cos(angle),
+        center.dy + radius * math.sin(angle),
+      );
+      
+      if (i == 0) {
+        path.moveTo(point.dx, point.dy);
+      } else {
+        path.lineTo(point.dx, point.dy);
+      }
+    }
+    path.close();
+    
+    // Draw shadow
+    canvas.drawShadow(path, shadowColor, 4, true);
+    
+    // Fill hexagon
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+    
+    canvas.drawPath(path, paint);
+    
+    // Draw border
+    paint
+      ..color = shadowColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+    
+    canvas.drawPath(path, paint);
+  }
+  
+  @override
+  bool shouldRepaint(covariant HexagonPainter oldDelegate) => false;
+}
+
+Widget _buildRecentExpenses() {
+  return ShimmerLoading(
+    isLoading: _isLoading,
+    child: GradientCard(
+      elevation: 4,
+      useGradientBorder: true,
+      borderWidth: 2,
+      isPrimary: true,
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.receipt_long_rounded,
+                    color: Theme.of(context).primaryColor,
+                    size: 20,
+                  ),
+                  SizedBox(width: 8),
+                  Text(
+                    'Recent Expenses',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                      color: Theme.of(context).primaryColor,
+                    ),
+                  ),
+                ],
+              ),
+              TextButton.icon(
+                icon: Icon(Icons.visibility_rounded, size: 16),
+                label: Text('View All'),
+                onPressed: () {
+                  // Navigate to full expenses list
+                  Navigator.pushNamed(context, '/my_expenses');
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _recentExpenses.isEmpty
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24.0),
+                  child: Column(
+                    children: [
+                      Icon(
+                        Icons.receipt_outlined,
+                        size: 48,
+                        color: Colors.grey[400],
+                      ),
+                      SizedBox(height: 16),
+                      Text(
+                        'No recent expenses found',
+                        style: TextStyle(color: Colors.grey[600]),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _recentExpenses.length,
+                separatorBuilder: (context, index) => const Divider(),
+                itemBuilder: (context, index) {
+                  final expense = _recentExpenses[index];
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Container(
+                      width: 46,
+                      height: 46,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            _getStatusColor(expense['status']),
+                            _getStatusColor(expense['status']).withOpacity(0.7),
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: _getStatusColor(expense['status']).withOpacity(0.3),
+                            blurRadius: 8,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Center(
+                        child: Icon(
+                          _getCategoryIcon(expense['category']),
+                          color: Colors.white,
+                          size: 22,
+                        ),
+                      ),
+                    ),
+                    title: Text(
+                      expense['title'],
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${expense['category']} • ${DateFormat('MMM d, yyyy').format(expense['date'])}',
+                    ),
+                    trailing: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Text(
+                          '\$${expense['amount'].toStringAsFixed(2)}',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: _getStatusColor(expense['status']).withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: _getStatusColor(expense['status']).withOpacity(0.3),
+                              width: 1,
+                            ),
+                          ),
+                          child: Text(
+                            _getStatusText(expense['status']),
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                              color: _getStatusColor(expense['status']),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    onTap: () {
+                      // Navigate to expense details
+                    },
+                  );
+                },
+              ),
+        ],
+      ),
+    ),
+  );
+}
+
+Color _getStatusColor(String status) {
+  switch (status) {
+    case 'approved':
+      return Colors.green;
+    case 'pending':
+      return Colors.orange;
+    case 'rejected':
+      return Colors.red;
+    default:
+      return Colors.grey;
+  }
+}
+
+String _getStatusText(String status) {
+  switch (status) {
+    case 'approved':
+      return 'Approved';
+    case 'pending':
+      return 'Pending';
+    case 'rejected':
+      return 'Rejected';
+    default:
+      return 'Unknown';
+  }
+}
+
+IconData _getCategoryIcon(String category) {
+  final lowerCategory = category.toLowerCase();
+  if (lowerCategory.contains('meal') || lowerCategory.contains('food') || lowerCategory.contains('lunch')) {
+    return Icons.restaurant_rounded;
+  } else if (lowerCategory.contains('transport') || lowerCategory.contains('taxi') || lowerCategory.contains('uber')) {
+    return Icons.local_taxi_rounded;
+  } else if (lowerCategory.contains('office') || lowerCategory.contains('supplies')) {
+    return Icons.shopping_bag_rounded;
+  } else if (lowerCategory.contains('travel') || lowerCategory.contains('flight') || lowerCategory.contains('hotel')) {
+    return Icons.flight_rounded;
+  } else if (lowerCategory.contains('tech') || lowerCategory.contains('software') || lowerCategory.contains('hardware')) {
+    return Icons.computer_rounded;
+  } else if (lowerCategory.contains('phone') || lowerCategory.contains('mobile') || lowerCategory.contains('call')) {
+    return Icons.phone_iphone_rounded;
+  } else if (lowerCategory.contains('meeting') || lowerCategory.contains('conference')) {
+    return Icons.groups_rounded;
+  } else if (lowerCategory.contains('medical') || lowerCategory.contains('health')) {
+    return Icons.medical_services_rounded;
+  } else if (lowerCategory.contains('training') || lowerCategory.contains('education')) {
+    return Icons.school_rounded;
+  } else if (lowerCategory.contains('entertainment') || lowerCategory.contains('event')) {
+    return Icons.event_rounded;
+  }
+  return Icons.receipt_rounded;
+} 

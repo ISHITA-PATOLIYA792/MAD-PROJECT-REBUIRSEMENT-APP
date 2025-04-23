@@ -1,6 +1,6 @@
 # Reimburse Desk
 
-A comprehensive, modern expense reimbursement management system built with Flutter.
+A comprehensive, modern expense reimbursement management system built with Flutter and Supabase.
 
 ## Table of Contents
 
@@ -13,15 +13,22 @@ A comprehensive, modern expense reimbursement management system built with Flutt
    - [Uniqueness](#uniqueness)
    - [Frameworks/Technologies](#frameworkstechnologies)
    - [Tech Stack](#tech-stack)
-4. [UI/UX Design](#uiux-design)
+4. [Authentication Features](#authentication-features)
+5. [Setup Instructions](#setup-instructions)
+6. [UI/UX Design](#uiux-design)
+   - [Dashboard UI Mockup](#dashboard-ui-mockup)
    - [Screens Overview](#screens-overview)
    - [User Flow](#user-flow)
-5. [Use Case](#use-case)
-6. [System Architecture](#system-architecture)
-7. [Coding Approach](#coding-approach)
+   - [Design Highlights](#design-highlights)
+7. [Use Case](#use-case)
+8. [System Architecture](#system-architecture)
+9. [Coding Approach](#coding-approach)
    - [Component System](#component-system)
    - [Border System](#border-system)
    - [Theme System](#theme-system)
+10. [Dependencies](#dependencies)
+11. [Troubleshooting](#troubleshooting)
+12. [Additional Resources](#additional-resources)
 
 ## Project Definition
 
@@ -102,7 +109,281 @@ Reimburse Desk differentiates itself through:
 - RESTful API architecture
 - WebSocket for real-time updates
 
+## Authentication Features
+
+- Email/Password authentication
+- Google Sign-In integration
+- GitHub Sign-In integration
+- Password reset functionality
+- Persistent login sessions
+- User profile management
+- Role-based authorization (Admin, Manager, Employee)
+
+## Setup Instructions
+
+### Prerequisites
+
+- Flutter SDK (stable channel)
+- A Supabase account
+- Google Developer account (for Google Sign-In)
+- GitHub Developer account (for GitHub Sign-In)
+
+### Step 1: Clone the repository
+
+```bash
+git clone <repository-url>
+cd reimbursement_box
+```
+
+### Step 2: Set up Supabase
+
+1. Create a new project on [Supabase](https://supabase.com/).
+2. Once your project is created, go to the SQL Editor in the Supabase dashboard.
+3. Execute the following SQL to set up the database schema:
+
+```sql
+-- Create users table (handled by Supabase Auth)
+
+-- Create profiles table
+CREATE TABLE profiles (
+  id UUID REFERENCES auth.users NOT NULL PRIMARY KEY,
+  email TEXT NOT NULL,
+  full_name TEXT,
+  avatar_url TEXT,
+  employee_id TEXT,
+  department TEXT,
+  role TEXT DEFAULT 'employee',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create expenses table
+CREATE TABLE expenses (
+  id SERIAL PRIMARY KEY,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  amount DECIMAL(10, 2) NOT NULL,
+  receipt_url TEXT,
+  category TEXT NOT NULL,
+  expense_date DATE NOT NULL,
+  status TEXT DEFAULT 'pending',
+  project_id INTEGER REFERENCES projects(id),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create projects table
+CREATE TABLE projects (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  start_date DATE,
+  end_date DATE,
+  budget DECIMAL(12, 2),
+  current_spend DECIMAL(12, 2) DEFAULT 0,
+  client TEXT,
+  status TEXT DEFAULT 'active',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create project_members table for team members
+CREATE TABLE project_members (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES auth.users,
+  role TEXT,
+  avatar_url TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Set up RLS (Row Level Security)
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_members ENABLE ROW LEVEL SECURITY;
+
+-- Create policies
+CREATE POLICY "Users can view their own profile" 
+ON profiles FOR SELECT USING (auth.uid() = id);
+
+CREATE POLICY "Users can update their own profile" 
+ON profiles FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Users can view their own expenses" 
+ON expenses FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can insert their own expenses" 
+ON expenses FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update their own expenses" 
+ON expenses FOR UPDATE USING (auth.uid() = user_id AND status = 'pending');
+
+-- Managers can see all expenses
+CREATE POLICY "Managers can view all expenses"
+ON expenses FOR SELECT USING (
+  EXISTS (SELECT 1 FROM profiles WHERE id = auth.uid() AND role IN ('manager', 'admin'))
+);
+
+-- Set up triggers
+CREATE OR REPLACE FUNCTION handle_new_user() 
+RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO profiles (id, email, full_name, avatar_url)
+  VALUES (new.id, new.email, new.raw_user_meta_data->>'full_name', new.raw_user_meta_data->>'avatar_url');
+  RETURN new;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE handle_new_user();
+```
+
+### Step 3: Configure Authentication Providers
+
+#### Email Provider
+1. In your Supabase dashboard, navigate to Authentication > Providers > Email.
+2. Ensure the Email provider is enabled.
+3. Configure settings for email confirmation if desired.
+
+#### Google Provider
+1. Navigate to Authentication > Providers > Google.
+2. Enable the Google provider.
+3. Follow the instructions to set up Google OAuth credentials.
+4. Add your app's redirect URL (typically: io.supabase.reimbursementbox://login-callback/).
+5. Copy your Google client ID and client secret to Supabase.
+
+#### GitHub Provider
+1. Navigate to Authentication > Providers > GitHub.
+2. Enable the GitHub provider.
+3. Register a new OAuth application on [GitHub](https://github.com/settings/developers).
+4. Set the Authorization callback URL to your Supabase redirect URL.
+5. Copy your GitHub client ID and client secret to Supabase.
+
+### Step 4: Environment Setup
+
+1. Create a .env file in the root of your project.
+2. Add the following variables with your Supabase details:
+
+```
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_REDIRECT_URL=io.supabase.reimbursementbox://login-callback/
+```
+
+### Step 5: Update Android Configuration
+
+For Android, update the android/app/src/main/AndroidManifest.xml file to include:
+
+```xml
+<intent-filter>
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <category android:name="android.intent.category.BROWSABLE" />
+    <data
+        android:scheme="io.supabase.reimbursementbox"
+        android:host="login-callback" />
+</intent-filter>
+```
+
+### Step 6: Update iOS Configuration
+
+For iOS, update the ios/Runner/Info.plist file to include:
+
+```xml
+<key>CFBundleURLTypes</key>
+<array>
+    <dict>
+        <key>CFBundleTypeRole</key>
+        <string>Editor</string>
+        <key>CFBundleURLSchemes</key>
+        <array>
+            <string>io.supabase.reimbursementbox</string>
+        </array>
+    </dict>
+</array>
+```
+
+### Step 7: Run the app
+
+```bash
+flutter pub get
+flutter run
+```
+
 ## UI/UX Design
+
+### Dashboard UI Mockup
+
+```
++--------------------------------------------------+
+|                                                  |
+| Reimburse Desk                        🌙  👤    |
+|                                                  |
+| +----------------------------------------------+ |
+| |                                              | |
+| | Welcome back,                                | |
+| | John Smith                                   | |
+| |                                              | |
+| | Your expense summary for July 2023           | |
+| |                                              | |
+| +----------------------------------------------+ |
+|                                                  |
+| +----------------------------------------------+ |
+| |                                              | |
+| | 📊 Expense Status                            | |
+| |                                              | |
+| | $3,420.75                $1,250.00  $850.50  | |
+| | +----------+  +----------+  +----------+     | |
+| | |Pending   |  |Approved  |  |Rejected  |     | |
+| | |    3     |  |    5     |  |    1     |     | |
+| | +----------+  +----------+  +----------+     | |
+| |                                              | |
+| | [View all expenses]                          | |
+| |                                              | |
+| +----------------------------------------------+ |
+|                                                  |
+| My Projects                                      |
+|                                                  |
+| +----------------+  +----------------+           |
+| |                |  |                |           |
+| | 🏢             |  | 🌐             |           |
+| | CRM Upgrade    |  | Website Redesign           |
+| |                |  |                |           |
+| | Budget: $25K   |  | Budget: $15K   |           |
+| | Spent: $18.5K  |  | Spent: $12.7K  |           |
+| | Members: 6     |  | Members: 4     |           |
+| |                |  |                |           |
+| +----------------+  +----------------+           |
+|                                                  |
+| Quick Actions                                    |
+|                                                  |
+| +----------------+  +----------------+           |
+| |                |  |                |           |
+| | 📸             |  | 📊             |           |
+| | Add Expense    |  | Reports        |           |
+| |                |  |                |           |
+| | Submit a new   |  | View expense   |           |
+| | expense with   |  | reports and    |           |
+| | receipt        |  | analytics      |           |
+| |                |  |                |           |
+| +----------------+  +----------------+           |
+|                                                  |
+| +----------------+  +----------------+           |
+| |                |  |                |           |
+| | 💼             |  | 💰             |           |
+| | My Projects    |  | Compensation   |           |
+| |                |  |                |           |
+| | Manage your    |  | View your      |           |
+| | active         |  | salary and     |           |
+| | projects       |  | benefits       |           |
+| |                |  |                |           |
+| +----------------+  +----------------+           |
+|                                                  |
++--------------------------------------------------+
+```
 
 ### Screens Overview
 
@@ -144,6 +425,16 @@ Reimburse Desk differentiates itself through:
 
 4. **Compensation Review Flow**
    - Dashboard → My Compensation → View breakdown → Access benefits details
+
+### Design Highlights
+
+1. **Clean Interface**: Minimalist design with proper spacing and visual hierarchy
+2. **Card-Based Layout**: Organized content in cards with consistent styling
+3. **Visual Progress Tracking**: Clear progress indicators and statistics
+4. **Modern Color Scheme**: Pleasant color palette with light/dark mode support
+5. **Descriptive Cards**: Feature cards with icons and descriptions
+6. **Gradient Borders**: Custom border system for a distinctive visual identity
+7. **Responsive Design**: Adapts to different screen sizes and orientations
 
 ## Use Case
 
@@ -238,3 +529,53 @@ The application features a comprehensive theming system:
 - **Consistent Color Palette**: Predefined color schemes for both modes
 - **Gradient Library**: Standard gradients for primary and secondary elements
 - **Material 3 Support**: Leverages latest Material Design guidelines
+
+## Dependencies
+
+- **flutter**: ^3.10.0
+- **cupertino_icons**: ^1.0.5
+- **supabase_flutter**: ^1.10.4
+- **flutter_dotenv**: ^5.0.2
+- **provider**: ^6.0.5
+- **shared_preferences**: ^2.1.1
+- **http**: ^1.1.0
+- **path**: ^1.8.3
+- **path_provider**: ^2.0.15
+- **image_picker**: ^0.8.7+5
+- **url_launcher**: ^6.1.11
+- **intl**: ^0.18.1
+- **lottie**: ^2.3.2
+- **fl_chart**: ^0.62.0
+- **pdf**: ^3.10.1
+- **sqflite**: ^2.2.8+4
+
+## Troubleshooting
+
+- **Authentication Issues**: 
+  - Verify redirect URLs match exactly in Supabase and app configurations
+  - Check Supabase logs for authentication errors
+  - Ensure proper permissions in database RLS policies
+
+- **Database Connection Issues**:
+  - Confirm API keys are correctly set in .env file
+  - Check internet connectivity
+  - Verify Supabase service status
+
+- **Image Upload Issues**:
+  - Check storage permissions in Supabase
+  - Verify file size limits
+  - Ensure proper error handling for upload failures
+
+- **Build Issues**:
+  - Run `flutter clean` followed by `flutter pub get`
+  - Check for dependency conflicts in pubspec.yaml
+  - Update Flutter SDK if necessary
+
+## Additional Resources
+
+- [Supabase Documentation](https://supabase.com/docs)
+- [Flutter Documentation](https://flutter.dev/docs)
+- [Supabase Flutter SDK](https://supabase.com/docs/reference/dart/introduction)
+- [Material Design Guidelines](https://material.io/design)
+- [Flutter Provider Pattern](https://pub.dev/packages/provider)
+- [FL Chart Documentation](https://pub.dev/packages/fl_chart)
